@@ -74,13 +74,16 @@ from typing import Annotated, Any, Literal, TypedDict
 
 import operator
 
-from langchain.agents import create_agent                     # LangChain 1.0+
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.constants import Send
+from langgraph.types import Send
 from langgraph.graph import END, StateGraph
+try:
+    from langchain.agents import create_react_agent
+except ImportError:
+    from langgraph.prebuilt import create_react_agent  # fallback for older versions
 from langsmith import traceable
 from pydantic import BaseModel, Field
 
@@ -521,10 +524,10 @@ def _summarize_events(raw: str) -> str:
                           "message": e.get("message", "")[:200],
                           "object": e.get("involvedObject", {}).get("name", ""),
                           "count": e.get("count", 1),
-                          "lastSeen": e.get("lastTimestamp", "")})
+                          "lastSeen": e.get("lastTimestamp") or e.get("eventTime") or ""})
         else:
             normal += 1
-    warns.sort(key=lambda x: x.get("lastSeen", ""), reverse=True)
+    warns.sort(key=lambda x: x.get("lastSeen") or "", reverse=True)
     return json.dumps({"normalCount": normal, "warnings": warns[:20]}, indent=2)
 
 
@@ -912,7 +915,14 @@ _shared_checkpointer, _checkpointer_type = _create_checkpointer()
 def _invoke_with_retry(agent, messages, config=None, max_retries=3):
     for attempt in range(1, max_retries + 1):
         try:
-            return agent.invoke(messages, config=config or {})
+            # Generate a fresh thread_id per attempt so a failed attempt's
+            # corrupted tool_use state is never replayed from the checkpointer.
+            run_config = dict(config or {})
+            if "configurable" in run_config:
+                cfg = dict(run_config["configurable"])
+                cfg["thread_id"] = f"{cfg.get('thread_id', 'run')}-att{attempt}-{int(time.time())}"
+                run_config["configurable"] = cfg
+            return agent.invoke(messages, config=run_config)
         except Exception as e:
             if attempt == max_retries: raise
             wait = 2 ** attempt
@@ -1252,9 +1262,7 @@ def diagnosis_node(state: AgentState) -> dict:
                 _log("diagnosis", f"Found {len(memory_lines)} relevant past incident(s)")
 
     llm = make_llm("diagnosis")
-    agent = create_agent(
-        model=llm, tools=[investigate],
-        system_prompt=f"""\
+    diagnosis_prompt = f"""\
 You are a Kubernetes Diagnosis Agent. You receive a list of unhealthy
 resources and must determine the root cause AND extract concrete details.
 
@@ -1286,14 +1294,19 @@ Output format — respond with ONLY a JSON object:
     }}
   ]
 }}
-Be precise — no placeholders.""",
-        checkpointer=_shared_checkpointer,
-        name="diagnosis_agent",
+Be precise — no placeholders."""
+
+    # create_react_agent: no shared checkpointer for sub-agents.
+    # Each invocation is single-turn — no cross-turn memory needed.
+    agent = create_react_agent(
+        model=llm,
+        tools=[investigate],
+        prompt=diagnosis_prompt,
     )
     result = _invoke_with_retry(
         agent,
         {"messages": [{"role": "user", "content": f"Investigate:\n{json.dumps(issues, indent=2)}"}]},
-        config={"configurable": {"thread_id": f"diagnosis-{id(state)}"}},
+        config={"configurable": {"thread_id": f"diagnosis-{int(time.time())}"}},
     )
 
     raw_response = result["messages"][-1].content
@@ -1358,9 +1371,7 @@ IMPORTANT — YOUR PREVIOUS ATTEMPT WAS REJECTED:
 Fix ALL issues listed above before responding. Do NOT repeat the same mistakes."""
 
     llm = make_llm("recommendation")
-    agent = create_agent(
-        model=llm, tools=[investigate],
-        system_prompt=f"""\
+    rec_prompt = f"""\
 You are a Kubernetes Recommendation Agent. Propose concrete kubectl commands.
 
 RULES:
@@ -1384,14 +1395,18 @@ Output format — respond with ONLY a JSON object:
       "alternative": "kubectl rollout restart deployment/api-server -n production"
     }}
   ]
-}}""",
-        checkpointer=_shared_checkpointer,
-        name="recommendation_agent",
+}}"""
+
+    # create_react_agent: no shared checkpointer for sub-agents.
+    agent = create_react_agent(
+        model=llm,
+        tools=[investigate],
+        prompt=rec_prompt,
     )
     result = _invoke_with_retry(
         agent,
         {"messages": [{"role": "user", "content": f"Propose fixes:\n{json.dumps(actionable, indent=2)}"}]},
-        config={"configurable": {"thread_id": f"recommendation-{id(state)}-r{reflexion_count}"}},
+        config={"configurable": {"thread_id": f"recommendation-{int(time.time())}-r{reflexion_count}"}},
     )
 
     raw_response = result["messages"][-1].content
