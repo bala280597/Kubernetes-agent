@@ -1,20 +1,19 @@
 """
 Benchmark: Optimized CLI-manifest agent vs MCP agent.
 
-The CLI agent uses the optimized architecture:
-  - Compact system prompt (no README injection)
-  - Automatic -o json injection for kubectl get
-  - Python-side parsing and structured JSON summaries
-  - Unhealthy-only filtering, log compression
-  - Discovery caching with TTL
-
-The MCP agent is unchanged for a fair comparison.
+Changes from original:
+  - from langchain.agents import create_agent (LangChain 1.0+)
+  - system_prompt= parameter (not prompt=)
+  - shell=False (security fix from original shell=True)
+  - LangSmith tracing via @traceable
+  - recursion_limit on agent invoke
+  - Per-approach LangSmith project names
 
 Setup:
-  pip install -U langgraph langchain-anthropic langchain-mcp-adapters "mcp[cli]"
+  pip install -U langchain langchain-anthropic langgraph langchain-mcp-adapters "mcp[cli]" langsmith
   export ANTHROPIC_API_KEY="your-key"
-
-  Place mcp_kubectl_server.py in the same folder.
+  export LANGSMITH_TRACING=true
+  export LANGSMITH_API_KEY="ls__your-key"
 
 Run:
   python benchmark.py
@@ -23,6 +22,7 @@ Run:
 import asyncio
 import json
 import os
+import platform
 import re
 import shlex
 import subprocess
@@ -30,26 +30,25 @@ import sys
 import time
 from pathlib import Path
 
+from langchain.agents import create_agent                     # LangChain 1.0+
 from langchain_anthropic import ChatAnthropic
 from langchain_core.tools import tool
 from langchain_mcp_adapters.tools import load_mcp_tools
-from langchain.agents import create_agent
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from langsmith import traceable
 
 WORKDIR = Path.cwd()
+IS_WINDOWS = platform.system() == "Windows"
 SERVER_SCRIPT = str(Path(__file__).parent / "mcp_kubectl_server.py")
 
-# ======================================================================
-# Shared model
-# ======================================================================
+
+def _setup_tracing(project_suffix: str):
+    os.environ["LANGSMITH_PROJECT"] = f"k8s-benchmark-{project_suffix}"
+
 
 def make_llm():
-    return ChatAnthropic(
-        model="claude-sonnet-4-6",
-        temperature=0.2,
-        max_tokens=4096,
-    )
+    return ChatAnthropic(model="claude-sonnet-4-6", temperature=0.2, max_tokens=4096)
 
 
 # ======================================================================
@@ -57,511 +56,272 @@ def make_llm():
 # ======================================================================
 
 _cache: dict[str, tuple[float, str]] = {}
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 300
 
 _CACHEABLE_COMMANDS = [
-    "kubectl get namespaces",
-    "kubectl get namespace",
-    "kubectl get ns",
-    "kubectl get nodes",
-    "kubectl get node",
-    "kubectl api-resources",
+    "kubectl get namespaces", "kubectl get namespace", "kubectl get ns",
+    "kubectl get nodes", "kubectl get node", "kubectl api-resources",
 ]
 
-
-def _cache_key(command: str) -> str | None:
-    stripped = command.strip()
-    for pattern in _CACHEABLE_COMMANDS:
-        if stripped == pattern or stripped.startswith(pattern + " "):
-            return pattern
+def _cache_key(command):
+    s = command.strip()
+    for p in _CACHEABLE_COMMANDS:
+        if s == p or s.startswith(p + " "): return p
     return None
 
-
-def _get_cached(key: str) -> str | None:
+def _get_cached(key):
     if key in _cache:
         ts, data = _cache[key]
-        if time.time() - ts < CACHE_TTL:
-            return data
+        if time.time() - ts < CACHE_TTL: return data
         del _cache[key]
     return None
 
-
-def _set_cache(key: str, data: str) -> None:
-    _cache[key] = (time.time(), data)
-
-
-def _clear_cache() -> None:
-    _cache.clear()
+def _set_cache(key, data): _cache[key] = (time.time(), data)
+def _clear_cache(): _cache.clear()
 
 
 # ======================================================================
 # Guardrails
 # ======================================================================
 
-ALLOWED_BINARIES = {
-    "kubectl", "helm", "grep", "jq", "cat", "echo",
-    "head", "tail", "wc", "sort", "uniq",
-}
-
+ALLOWED_BINARIES = {"kubectl","helm","grep","jq","cat","echo","head","tail","wc","sort","uniq"}
 BLOCKED_PATTERNS = (
-    "kubectl delete", "kubectl apply", "kubectl scale",
-    "kubectl edit", "kubectl rollout undo", "kubectl exec",
-    "kubectl cp", "kubectl patch", "kubectl replace", "kubectl set",
-    "rm -rf", "shutdown", "reboot",
+    "kubectl delete","kubectl apply","kubectl scale","kubectl edit",
+    "kubectl rollout undo","kubectl exec","kubectl cp","kubectl patch",
+    "kubectl replace","kubectl set","rm -rf","shutdown","reboot",
 )
 
-
-def _cmd_allowed(command: str) -> str | None:
+def _cmd_allowed(command):
     lowered = command.lower().strip()
     for p in BLOCKED_PATTERNS:
-        if p in lowered:
-            return f"BLOCKED: '{p}'"
-    try:
-        base = Path(shlex.split(command)[0]).name
-    except (ValueError, IndexError):
-        return "BLOCKED: parse error"
-    if base not in ALLOWED_BINARIES:
-        return f"BLOCKED: '{base}' not allowed"
+        if p in lowered: return f"BLOCKED: '{p}'"
+    try: base = Path(shlex.split(command)[0]).name
+    except (ValueError, IndexError): return "BLOCKED: parse error"
+    if base not in ALLOWED_BINARIES: return f"BLOCKED: '{base}' not allowed"
     return None
 
 
 # ======================================================================
-# JSON injection — auto-add -o json to kubectl get commands
+# JSON injection
 # ======================================================================
 
 _GET_PATTERN = re.compile(r"^kubectl\s+get\s+(?!-)", re.IGNORECASE)
-_SKIP_JSON_INJECTION = re.compile(
-    r"-o\s+(json|yaml|wide|jsonpath|custom-columns|name)", re.IGNORECASE
-)
+_SKIP_JSON = re.compile(r"-o\s+(json|yaml|wide|jsonpath|custom-columns|name)", re.IGNORECASE)
 _TOP_PATTERN = re.compile(r"^kubectl\s+top\s+", re.IGNORECASE)
 
-
-def _maybe_inject_json(command: str) -> tuple[str, bool]:
-    stripped = command.strip()
-    if "|" in stripped:
-        return stripped, False
-    if _TOP_PATTERN.match(stripped):
-        return stripped, False
-    if _SKIP_JSON_INJECTION.search(stripped):
-        return stripped, False
-    if _GET_PATTERN.match(stripped):
-        return stripped + " -o json", True
-    return stripped, False
+def _maybe_inject_json(command):
+    s = command.strip()
+    if "|" in s or _TOP_PATTERN.match(s) or _SKIP_JSON.search(s): return s, False
+    if _GET_PATTERN.match(s): return s + " -o json", True
+    return s, False
 
 
 # ======================================================================
-# Output summarizers
+# Output summarizers (same as multi_agent.py — extract to shared module for production)
 # ======================================================================
 
-def _summarize_pods(raw_json: str) -> str:
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return raw_json
+def _safe_parse(raw):
+    try: data = json.loads(raw)
+    except json.JSONDecodeError: return None, raw
+    if isinstance(data, list): return data, raw
+    if isinstance(data, dict):
+        if "items" in data: return data["items"], raw
+        return [data], raw
+    return None, raw
 
-    items = data.get("items", [])
-    if not items:
-        return json.dumps({"total": 0, "pods": []}, indent=2)
-
-    summary: dict = {"total": len(items), "healthy": 0, "unhealthy": []}
-
+def _summarize_pods(raw):
+    items, raw = _safe_parse(raw)
+    if items is None: return raw
+    if not items: return json.dumps({"total":0,"pods":[]},indent=2)
+    s = {"total":len(items),"healthy":0,"unhealthy":[]}
     for pod in items:
-        name = pod.get("metadata", {}).get("name", "unknown")
-        namespace = pod.get("metadata", {}).get("namespace", "unknown")
-        phase = pod.get("status", {}).get("phase", "Unknown")
-
-        container_statuses = pod.get("status", {}).get("containerStatuses", [])
-        restart_count = sum(cs.get("restartCount", 0) for cs in container_statuses)
-        ready = all(cs.get("ready", False) for cs in container_statuses) if container_statuses else False
-
-        waiting_reasons = []
-        for cs in container_statuses:
-            waiting = cs.get("state", {}).get("waiting", {})
-            if waiting.get("reason"):
-                waiting_reasons.append(waiting["reason"])
-        for cs in pod.get("status", {}).get("initContainerStatuses", []):
-            waiting = cs.get("state", {}).get("waiting", {})
-            if waiting.get("reason"):
-                waiting_reasons.append(f"init:{waiting['reason']}")
-
-        last_terminated_reason = None
-        for cs in container_statuses:
-            terminated = cs.get("lastState", {}).get("terminated", {})
-            if terminated.get("reason"):
-                last_terminated_reason = terminated["reason"]
-
-        is_healthy = (
-            phase in ("Running", "Succeeded")
-            and ready
-            and not waiting_reasons
-            and restart_count < 5
-        )
-
-        if is_healthy:
-            summary["healthy"] += 1
+        name=pod.get("metadata",{}).get("name","?")
+        ns=pod.get("metadata",{}).get("namespace","?")
+        phase=pod.get("status",{}).get("phase","?")
+        css=pod.get("status",{}).get("containerStatuses",[])
+        restarts=sum(c.get("restartCount",0) for c in css)
+        ready=all(c.get("ready",False) for c in css) if css else False
+        waits=[c.get("state",{}).get("waiting",{}).get("reason") for c in css if c.get("state",{}).get("waiting",{}).get("reason")]
+        for c in pod.get("status",{}).get("initContainerStatuses",[]):
+            w=c.get("state",{}).get("waiting",{}).get("reason")
+            if w: waits.append(f"init:{w}")
+        ok = phase in ("Running","Succeeded") and ready and not waits and restarts<5
+        if ok: s["healthy"]+=1
         else:
-            pod_info: dict = {
-                "name": name, "namespace": namespace,
-                "phase": phase, "ready": ready, "restarts": restart_count,
-            }
-            if waiting_reasons:
-                pod_info["waitingReasons"] = waiting_reasons
-            if last_terminated_reason:
-                pod_info["lastTerminatedReason"] = last_terminated_reason
-            summary["unhealthy"].append(pod_info)
+            info={"name":name,"namespace":ns,"phase":phase,"ready":ready,"restarts":restarts}
+            if waits: info["waitingReasons"]=waits
+            s["unhealthy"].append(info)
+    return json.dumps(s,indent=2)
 
-    return json.dumps(summary, indent=2)
+def _summarize_nodes(raw):
+    items, raw = _safe_parse(raw)
+    if items is None: return raw
+    nodes=[]
+    for n in items:
+        name=n.get("metadata",{}).get("name","?")
+        conds=n.get("status",{}).get("conditions",[])
+        ready="Unknown"; issues=[]
+        for c in conds:
+            if c.get("type")=="Ready": ready=c.get("status","?")
+            elif c.get("status")=="True" and c.get("type")!="Ready": issues.append(c["type"])
+        ni=n.get("status",{}).get("nodeInfo",{})
+        nodes.append({"name":name,"ready":ready,"kubeletVersion":ni.get("kubeletVersion",""),
+                      "os":ni.get("osImage",""),"issues":issues or None})
+    return json.dumps({"total":len(nodes),"nodes":nodes},indent=2)
 
+def _summarize_namespaces(raw):
+    items, raw = _safe_parse(raw)
+    if items is None: return raw
+    return json.dumps({"total":len(items),"namespaces":[
+        {"name":i.get("metadata",{}).get("name",""),"status":i.get("status",{}).get("phase","")} for i in items]},indent=2)
 
-def _summarize_nodes(raw_json: str) -> str:
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return raw_json
+def _summarize_deployments(raw):
+    items, raw = _safe_parse(raw)
+    if items is None: return raw
+    bad=[]
+    for d in items:
+        desired=d.get("spec",{}).get("replicas",0); st=d.get("status",{})
+        rdy=st.get("readyReplicas",0); avail=st.get("availableReplicas",0)
+        if rdy!=desired or avail!=desired:
+            bad.append({"name":d.get("metadata",{}).get("name",""),"namespace":d.get("metadata",{}).get("namespace",""),
+                        "desired":desired,"ready":rdy,"available":avail})
+    return json.dumps({"total":len(items),"healthy":len(items)-len(bad),"unhealthy":bad},indent=2)
 
-    items = data.get("items", [])
-    nodes = []
-    for node in items:
-        name = node.get("metadata", {}).get("name", "unknown")
-        conditions = node.get("status", {}).get("conditions", [])
-        ready = "Unknown"
-        issues = []
-        for cond in conditions:
-            if cond.get("type") == "Ready":
-                ready = cond.get("status", "Unknown")
-            elif cond.get("status") == "True" and cond.get("type") != "Ready":
-                issues.append(cond["type"])
-        node_info = node.get("status", {}).get("nodeInfo", {})
-        nodes.append({
-            "name": name, "ready": ready,
-            "kubeletVersion": node_info.get("kubeletVersion", ""),
-            "os": node_info.get("osImage", ""),
-            "issues": issues if issues else None,
-        })
-    return json.dumps({"total": len(nodes), "nodes": nodes}, indent=2)
+def _summarize_events(raw):
+    items, raw = _safe_parse(raw)
+    if items is None: return raw
+    warns=[]; normal=0
+    for e in items:
+        if e.get("type","Normal")!="Normal":
+            warns.append({"reason":e.get("reason",""),"message":e.get("message","")[:200],
+                          "object":e.get("involvedObject",{}).get("name",""),"count":e.get("count",1),
+                          "lastSeen":e.get("lastTimestamp","")})
+        else: normal+=1
+    warns.sort(key=lambda x:x.get("lastSeen",""),reverse=True)
+    return json.dumps({"normalEventCount":normal,"warnings":warns[:20]},indent=2)
 
+def _summarize_services(raw):
+    items, raw = _safe_parse(raw)
+    if items is None: return raw
+    svcs=[{"name":s.get("metadata",{}).get("name",""),"namespace":s.get("metadata",{}).get("namespace",""),
+           "type":s.get("spec",{}).get("type",""),"clusterIP":s.get("spec",{}).get("clusterIP",""),
+           "ports":[{"port":p.get("port"),"targetPort":p.get("targetPort")} for p in s.get("spec",{}).get("ports",[])]}
+          for s in items]
+    return json.dumps({"total":len(svcs),"services":svcs},indent=2)
 
-def _summarize_namespaces(raw_json: str) -> str:
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return raw_json
-    items = data.get("items", [])
-    namespaces = [
-        {"name": ns.get("metadata", {}).get("name", "unknown"),
-         "status": ns.get("status", {}).get("phase", "Unknown")}
-        for ns in items
-    ]
-    return json.dumps({"total": len(namespaces), "namespaces": namespaces}, indent=2)
+def _summarize_generic(raw):
+    items, raw = _safe_parse(raw)
+    if items is None: return raw
+    return json.dumps({"total":len(items),"items":[
+        {"name":i.get("metadata",{}).get("name",""),"namespace":i.get("metadata",{}).get("namespace","")} for i in items]},indent=2)
 
-
-def _summarize_deployments(raw_json: str) -> str:
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return raw_json
-    items = data.get("items", [])
-    unhealthy = []
-    for dep in items:
-        name = dep.get("metadata", {}).get("name", "unknown")
-        namespace = dep.get("metadata", {}).get("namespace", "unknown")
-        spec_replicas = dep.get("spec", {}).get("replicas", 0)
-        status = dep.get("status", {})
-        ready = status.get("readyReplicas", 0)
-        available = status.get("availableReplicas", 0)
-        updated = status.get("updatedReplicas", 0)
-        if ready != spec_replicas or available != spec_replicas:
-            unhealthy.append({
-                "name": name, "namespace": namespace,
-                "desired": spec_replicas, "ready": ready,
-                "available": available, "updated": updated,
-            })
-    return json.dumps({
-        "total": len(items), "healthy": len(items) - len(unhealthy),
-        "unhealthy": unhealthy,
-    }, indent=2)
-
-
-def _summarize_events(raw_json: str) -> str:
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return raw_json
-    items = data.get("items", [])
-    warnings = []
-    normal_count = 0
-    for evt in items:
-        if evt.get("type", "Normal") != "Normal":
-            warnings.append({
-                "type": evt.get("type", ""), "reason": evt.get("reason", ""),
-                "message": evt.get("message", "")[:200],
-                "object": evt.get("involvedObject", {}).get("name", ""),
-                "count": evt.get("count", 1),
-                "lastSeen": evt.get("lastTimestamp", ""),
-            })
-        else:
-            normal_count += 1
-    warnings.sort(key=lambda e: e.get("lastSeen", ""), reverse=True)
-    return json.dumps({
-        "normalEventCount": normal_count, "warnings": warnings[:20],
-    }, indent=2)
-
-
-def _summarize_services(raw_json: str) -> str:
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return raw_json
-    items = data.get("items", [])
-    services = []
-    for svc in items:
-        spec = svc.get("spec", {})
-        ports = [
-            {"port": p.get("port"), "targetPort": p.get("targetPort"), "protocol": p.get("protocol")}
-            for p in spec.get("ports", [])
-        ]
-        services.append({
-            "name": svc.get("metadata", {}).get("name", ""),
-            "namespace": svc.get("metadata", {}).get("namespace", ""),
-            "type": spec.get("type", ""),
-            "clusterIP": spec.get("clusterIP", ""),
-            "ports": ports,
-        })
-    return json.dumps({"total": len(services), "services": services}, indent=2)
-
-
-def _summarize_generic(raw_json: str) -> str:
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        return raw_json
-    items = data.get("items", [])
-    results = []
-    for item in items:
-        meta = item.get("metadata", {})
-        entry: dict = {"name": meta.get("name", "unknown"), "namespace": meta.get("namespace", "")}
-        status = item.get("status", {})
-        if isinstance(status, dict) and "phase" in status:
-            entry["phase"] = status["phase"]
-        results.append(entry)
-    return json.dumps({"total": len(results), "items": results}, indent=2)
-
-
-def _summarize_describe(raw_text: str) -> str:
-    lines = raw_text.splitlines()
-    result: dict = {}
-    events: list[str] = []
-    conditions: list[str] = []
-    in_events = False
-    in_conditions = False
-
+def _summarize_describe(raw):
+    lines=raw.splitlines(); result={}; events=[]; conditions=[]; in_ev=in_cond=False
     for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("Status:"):
-            result["status"] = stripped.split(":", 1)[1].strip()
-        elif stripped.startswith("Restart Count:"):
-            try:
-                result["restartCount"] = int(stripped.split(":", 1)[1].strip())
-            except ValueError:
-                result["restartCount"] = stripped.split(":", 1)[1].strip()
-        elif stripped.startswith("Reason:"):
-            result["reason"] = stripped.split(":", 1)[1].strip()
-        elif stripped.startswith("Message:"):
-            result["message"] = stripped.split(":", 1)[1].strip()
-        elif stripped.startswith("Exit Code:"):
-            try:
-                result["exitCode"] = int(stripped.split(":", 1)[1].strip())
-            except ValueError:
-                pass
-        elif stripped.startswith("QoS Class:"):
-            result["qosClass"] = stripped.split(":", 1)[1].strip()
-        elif stripped.startswith("Node:"):
-            result["node"] = stripped.split(":", 1)[1].strip()
+        s=line.strip()
+        if s.startswith("Status:"): result["status"]=s.split(":",1)[1].strip()
+        elif s.startswith("Restart Count:"):
+            try: result["restartCount"]=int(s.split(":",1)[1].strip())
+            except ValueError: pass
+        elif s.startswith("Reason:"): result["reason"]=s.split(":",1)[1].strip()
+        elif s.startswith("Message:"): result["message"]=s.split(":",1)[1].strip()
+        if s.startswith("Conditions:"): in_cond,in_ev=True,False; continue
+        elif s.startswith("Events:"): in_ev,in_cond=True,False; continue
+        elif s and not s.startswith(" ") and ":" in s: in_ev=in_cond=False
+        if in_ev and s and not s.startswith("Type"): events.append(s[:150])
+        if in_cond and s and not s.startswith("Type"): conditions.append(s[:150])
+    if events: result["events"]=events[-10:]
+    if conditions: result["conditions"]=conditions
+    return json.dumps(result,indent=2) if result else raw[:3000]
 
-        if stripped.startswith("Conditions:"):
-            in_conditions, in_events = True, False
-            continue
-        elif stripped.startswith("Events:"):
-            in_events, in_conditions = True, False
-            continue
-        elif stripped and not stripped.startswith(" ") and ":" in stripped:
-            in_events = in_conditions = False
-
-        if in_events and stripped and not stripped.startswith("Type"):
-            events.append(stripped[:150])
-        if in_conditions and stripped and not stripped.startswith("Type"):
-            conditions.append(stripped[:150])
-
-    if events:
-        result["events"] = events[-10:]
-    if conditions:
-        result["conditions"] = conditions
-    if not result:
-        return raw_text[:3000]
-    return json.dumps(result, indent=2)
-
-
-def _summarize_logs(raw_text: str) -> str:
-    lines = raw_text.splitlines()
-    error_pat = re.compile(r"error|exception|fatal|panic|traceback|oom|killed", re.IGNORECASE)
-    warn_pat = re.compile(r"warn", re.IGNORECASE)
-
-    errors, warnings = [], []
-    for line in lines:
-        s = line.strip()
-        if not s:
-            continue
-        if error_pat.search(s):
-            errors.append(s[:200])
-        elif warn_pat.search(s):
-            warnings.append(s[:200])
-
-    def _dedup(items: list[str], limit: int) -> list[str]:
-        seen: set[str] = set()
-        out = []
-        for item in items:
-            key = item[:80]
-            if key not in seen:
-                seen.add(key)
-                out.append(item)
+def _summarize_logs(raw):
+    lines=raw.splitlines()
+    ep=re.compile(r"error|exception|fatal|panic|traceback|oom|killed",re.IGNORECASE)
+    wp=re.compile(r"warn",re.IGNORECASE)
+    errors=[s[:200] for line in lines if (s:=line.strip()) and ep.search(s)]
+    warns=[s[:200] for line in lines if (s:=line.strip()) and wp.search(s) and not ep.search(s)]
+    def dedup(items,limit):
+        seen,out=set(),[]
+        for i in items:
+            k=i[:80]
+            if k not in seen: seen.add(k); out.append(i)
         return out[:limit]
+    return json.dumps({"totalLines":len(lines),"errorCount":len(errors),"warningCount":len(warns),
+                       "uniqueErrors":dedup(errors,15),"uniqueWarnings":dedup(warns,10)},indent=2)
 
-    return json.dumps({
-        "totalLines": len(lines),
-        "errorCount": len(errors), "warningCount": len(warnings),
-        "uniqueErrors": _dedup(errors, 15),
-        "uniqueWarnings": _dedup(warnings, 10),
-    }, indent=2)
+def _matches(cmd,patterns): return any(p in cmd for p in patterns)
 
-
-# ======================================================================
-# Command-type detection and routing
-# ======================================================================
-
-def _matches(cmd: str, patterns: list[str]) -> bool:
-    return any(p in cmd for p in patterns)
-
-
-def _detect_and_summarize(command: str, raw_output: str, was_json_injected: bool) -> str:
-    cmd_lower = command.lower().strip()
-
-    if was_json_injected or "-o json" in cmd_lower or "-o=json" in cmd_lower:
-        if _matches(cmd_lower, ["get pods", "get pod", "get po"]):
-            return _summarize_pods(raw_output)
-        elif _matches(cmd_lower, ["get nodes", "get node", "get no "]):
-            return _summarize_nodes(raw_output)
-        elif _matches(cmd_lower, ["get namespaces", "get namespace", "get ns"]):
-            return _summarize_namespaces(raw_output)
-        elif _matches(cmd_lower, ["get deployments", "get deployment", "get deploy"]):
-            return _summarize_deployments(raw_output)
-        elif _matches(cmd_lower, ["get events", "get event", "get ev "]):
-            return _summarize_events(raw_output)
-        elif _matches(cmd_lower, ["get svc", "get services", "get service"]):
-            return _summarize_services(raw_output)
-        else:
-            return _summarize_generic(raw_output)
-
-    if _matches(cmd_lower, ["describe pod", "describe pods"]):
-        return _summarize_describe(raw_output)
-    elif _matches(cmd_lower, ["logs ", "log "]):
-        return _summarize_logs(raw_output)
-    elif _matches(cmd_lower, ["describe "]):
-        return _summarize_describe(raw_output)
-
-    if len(raw_output) > 5000:
-        return raw_output[:5000] + "\n[... truncated ...]"
-    return raw_output
+def _detect_and_summarize(command, raw, injected):
+    c=command.lower().strip()
+    if injected or "-o json" in c or "-o=json" in c:
+        if _matches(c,["get pods","get pod","get po"]): return _summarize_pods(raw)
+        elif _matches(c,["get nodes","get node","get no "]): return _summarize_nodes(raw)
+        elif _matches(c,["get namespaces","get namespace","get ns"]): return _summarize_namespaces(raw)
+        elif _matches(c,["get deployments","get deployment","get deploy"]): return _summarize_deployments(raw)
+        elif _matches(c,["get events","get event","get ev "]): return _summarize_events(raw)
+        elif _matches(c,["get svc","get services","get service"]): return _summarize_services(raw)
+        else: return _summarize_generic(raw)
+    if _matches(c,["describe pod","describe pods"]): return _summarize_describe(raw)
+    elif _matches(c,["logs ","log "]): return _summarize_logs(raw)
+    elif _matches(c,["describe "]): return _summarize_describe(raw)
+    return raw[:5000]+"\n[... truncated ...]" if len(raw)>5000 else raw
 
 
 # ======================================================================
-# Optimized CLI tool — intelligent summarization
+# CLI tool — shell=False (FIXED from original shell=True)
 # ======================================================================
 
 @tool
+@traceable(name="run_cli_optimized_tool", metadata={"agent": "cli"})
 def run_cli_optimized(command: str) -> str:
-    """Execute a kubectl or helm command against the cluster.
-    Returns structured JSON summaries for common operations.
-    For kubectl get, output is automatically parsed and summarized.
-    For describe/logs, key fields and errors are extracted.
-    Healthy resources are counted; only unhealthy ones are listed in detail."""
-
+    """Execute a kubectl or helm command. Returns structured JSON summaries."""
     err = _cmd_allowed(command)
-    if err:
-        return err
-
-    # Check cache
+    if err: return err
     ckey = _cache_key(command)
     if ckey:
         cached = _get_cached(ckey)
-        if cached:
-            return cached
-
-    # Auto-inject -o json
-    actual_command, was_json_injected = _maybe_inject_json(command)
-
+        if cached: return cached
+    actual, injected = _maybe_inject_json(command)
     try:
-        proc = subprocess.run(
-            actual_command, shell=True, capture_output=True,
-            text=True, timeout=120, cwd=WORKDIR,
-        )
+        args = shlex.split(actual, posix=not IS_WINDOWS)
+        proc = subprocess.run(args, shell=False, capture_output=True,
+                              text=True, timeout=120, cwd=WORKDIR)
     except subprocess.TimeoutExpired:
-        return json.dumps({"success": False, "error": "Command timed out after 120s"})
-
-    stdout = proc.stdout or ""
-    stderr = proc.stderr or ""
-
+        return json.dumps({"success":False,"error":"Command timed out after 120s"})
+    except FileNotFoundError:
+        return json.dumps({"success":False,"error":f"Command not found"})
     if proc.returncode != 0:
-        return json.dumps({
-            "success": False, "exitCode": proc.returncode,
-            "error": stderr.strip()[:1000] or "Command failed with no stderr",
-        }, indent=2)
-
+        return json.dumps({"success":False,"exitCode":proc.returncode,
+                           "error":(proc.stderr or "").strip()[:1000] or "Command failed"},indent=2)
+    stdout = proc.stdout or ""
     if not stdout.strip():
-        return json.dumps({"success": True, "result": "No resources found"})
-
-    summarized = _detect_and_summarize(command, stdout, was_json_injected)
-
-    if ckey:
-        _set_cache(ckey, summarized)
-
+        return json.dumps({"success":True,"result":"No resources found"})
+    summarized = _detect_and_summarize(command, stdout, injected)
+    if ckey: _set_cache(ckey, summarized)
     return summarized
 
 
-
 # ======================================================================
-# Metric extraction
+# Metrics
 # ======================================================================
 
-def _extract_metrics(result: dict, approach: str, task: str,
-                     tool_count: int, elapsed: float) -> dict:
+@traceable(name="extract_metrics", run_type="parser")
+def _extract_metrics(result, approach, task, tool_count, elapsed):
     messages = result["messages"]
-    inp_tok = out_tok = tool_calls = 0
+    inp_tok=out_tok=tool_calls=0
     for msg in messages:
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            tool_calls += len(msg.tool_calls)
-        usage = getattr(msg, "usage_metadata", None)
-        if usage:
-            inp_tok += usage.get("input_tokens", 0)
-            out_tok += usage.get("output_tokens", 0)
-    return {
-        "approach": approach,
-        "task": task,
-        "tool_count": tool_count,
-        "tool_calls_made": tool_calls,
-        "input_tokens": inp_tok,
-        "output_tokens": out_tok,
-        "total_tokens": inp_tok + out_tok,
-        "elapsed_seconds": round(elapsed, 2),
-        "message_count": len(messages),
-        "answer_length": len(messages[-1].content) if messages else 0,
-    }
+        if hasattr(msg,"tool_calls") and msg.tool_calls: tool_calls+=len(msg.tool_calls)
+        usage = getattr(msg,"usage_metadata",None)
+        if usage: inp_tok+=usage.get("input_tokens",0); out_tok+=usage.get("output_tokens",0)
+    return {"approach":approach,"task":task,"tool_count":tool_count,
+            "tool_calls_made":tool_calls,"input_tokens":inp_tok,"output_tokens":out_tok,
+            "total_tokens":inp_tok+out_tok,"elapsed_seconds":round(elapsed,2),
+            "message_count":len(messages),"answer_length":len(messages[-1].content) if messages else 0}
 
 
 # ======================================================================
 # Agent runners
 # ======================================================================
-
-# --- Optimized CLI agent (compact prompt, intelligent tool) ---
 
 CLI_OPTIMIZED_PROMPT = """\
 You are an autonomous Kubernetes operations agent.
@@ -569,13 +329,9 @@ You are an autonomous Kubernetes operations agent.
 You interact with the cluster through the run_cli_optimized tool, which
 executes kubectl and helm commands. The tool automatically:
 - Converts kubectl get output to structured JSON summaries
-- Filters to show only unhealthy/notable resources (healthy ones are counted)
+- Filters to show only unhealthy/notable resources
 - Extracts key fields from describe output
 - Extracts errors and warnings from logs
-
-Available operations: namespaces, pods, deployments, statefulsets, daemonsets,
-jobs, cronjobs, services, ingress, endpoints, configmaps, secrets (keys only),
-PVCs, PVs, nodes, events, HPA, rollout status/history, resource usage (top).
 
 Workflow:
 1. Read the user's task.
@@ -585,34 +341,31 @@ Workflow:
 5. Summarize: what you checked, findings, root cause, recommended actions.
 
 Rules:
-- Trust the tool's summaries; don't ask for raw output unless insufficient.
-- For mutating commands, do NOT execute. Report the command and ask to confirm.
+- Trust the tool's summaries.
+- For mutating commands, do NOT execute. Report and ask to confirm.
 - Never expose secret values.
-- Be concise in your final summary.
-"""
+- Be concise."""
 
 
-async def run_cli_optimized_agent(task: str) -> dict:
-    """Run the optimized CLI agent and return metrics."""
-    _clear_cache()  # fresh cache per task
+@traceable(name="cli_optimized_agent_run", run_type="chain", metadata={"approach":"CLI-Optimized"})
+async def run_cli_optimized_agent(task):
+    _setup_tracing("cli-optimized")
+    _clear_cache()
     llm = make_llm()
-    agent = create_agent(
-        model=llm, tools=[run_cli_optimized], system_prompt=CLI_OPTIMIZED_PROMPT
-    )
+    agent = create_agent(model=llm, tools=[run_cli_optimized],
+                         system_prompt=CLI_OPTIMIZED_PROMPT, name="cli_agent")
     t0 = time.perf_counter()
-    result = await agent.ainvoke({"messages": [{"role": "user", "content": task}]})
+    result = await agent.ainvoke(
+        {"messages": [{"role":"user","content":task}]},
+        config={"recursion_limit": 25})
     elapsed = time.perf_counter() - t0
     return _extract_metrics(result, "CLI-Optimized", task, tool_count=1, elapsed=elapsed)
 
 
-
-# --- MCP agent (unchanged) ---
-
-async def run_mcp_agent(task: str) -> dict:
-    """Run the MCP agent and return metrics."""
-    server_params = StdioServerParameters(
-        command=sys.executable, args=[SERVER_SCRIPT],
-    )
+@traceable(name="mcp_agent_run", run_type="chain", metadata={"approach":"MCP"})
+async def run_mcp_agent(task):
+    _setup_tracing("mcp")
+    server_params = StdioServerParameters(command=sys.executable, args=[SERVER_SCRIPT])
     system_prompt = (
         "You are an autonomous Kubernetes operations agent.\n"
         "You have MCP tools for kubectl operations. Use them to inspect the cluster.\n"
@@ -625,19 +378,19 @@ async def run_mcp_agent(task: str) -> dict:
             tools = await load_mcp_tools(session)
             tool_count = len(tools)
             print(f"  [mcp] Discovered {tool_count} tools")
-
             llm = make_llm()
-            agent = create_agent(model=llm, tools=tools, system_prompt=system_prompt)
+            agent = create_agent(model=llm, tools=tools,
+                                 system_prompt=system_prompt, name="mcp_agent")
             t0 = time.perf_counter()
             result = await agent.ainvoke(
-                {"messages": [{"role": "user", "content": task}]}
-            )
+                {"messages": [{"role":"user","content":task}]},
+                config={"recursion_limit": 25})
             elapsed = time.perf_counter() - t0
             return _extract_metrics(result, "MCP", task, tool_count=tool_count, elapsed=elapsed)
 
 
 # ======================================================================
-# Benchmark harness — CLI-Optimized vs MCP
+# Benchmark harness
 # ======================================================================
 
 TASKS = [
@@ -648,131 +401,61 @@ TASKS = [
     "Get events in kube-system namespace sorted by time",
 ]
 
-APPROACHES = [
-    ("CLI-Optimized", run_cli_optimized_agent),
-    ("MCP",           run_mcp_agent),
-]
+APPROACHES = [("CLI-Optimized", run_cli_optimized_agent), ("MCP", run_mcp_agent)]
 
+def _empty_metrics(approach, task):
+    return {"approach":approach,"task":task,"tool_count":0,"tool_calls_made":0,
+            "input_tokens":0,"output_tokens":0,"total_tokens":0,
+            "elapsed_seconds":0,"message_count":0,"answer_length":0}
 
-def _empty_metrics(approach: str, task: str) -> dict:
-    return {
-        "approach": approach, "task": task, "tool_count": 0,
-        "tool_calls_made": 0, "input_tokens": 0, "output_tokens": 0,
-        "total_tokens": 0, "elapsed_seconds": 0, "message_count": 0,
-        "answer_length": 0,
-    }
-
-
-def print_comparison(all_results: dict[str, list[dict]]):
-    """Print a side-by-side comparison table."""
-    sep = "-" * 100
-    print(f"\n{'=' * 100}")
-    print(f"{'BENCHMARK RESULTS':^100}")
-    print(f"{'=' * 100}\n")
-
-    def avg(lst, key):
-        vals = [m[key] for m in lst]
-        return sum(vals) / len(vals) if vals else 0
-
-    cli = all_results["CLI-Optimized"]
-    mcp = all_results["MCP"]
-
-    # Summary table
-    hdr = f"  {'Metric':<30} {'CLI-Optimized':>15} {'MCP':>15} {'Diff':>15} {'Winner':>12}"
-    print(hdr)
+def print_comparison(all_results):
+    sep="-"*100
+    print(f"\n{'='*100}\n{'BENCHMARK RESULTS':^100}\n{'='*100}\n")
+    def avg(lst,key):
+        vals=[m[key] for m in lst]
+        return sum(vals)/len(vals) if vals else 0
+    cli=all_results["CLI-Optimized"]; mcp=all_results["MCP"]
+    print(f"  {'Metric':<30} {'CLI-Optimized':>15} {'MCP':>15} {'Diff':>15} {'Winner':>12}")
     print(sep)
-
-    comparisons = [
-        ("Avg input tokens",    "input_tokens"),
-        ("Avg output tokens",   "output_tokens"),
-        ("Avg total tokens",    "total_tokens"),
-        ("Avg tool calls",      "tool_calls_made"),
-        ("Avg elapsed (s)",     "elapsed_seconds"),
-        ("Avg answer length",   "answer_length"),
-        ("Avg messages",        "message_count"),
-    ]
-
-    for label, key in comparisons:
-        cli_val = avg(cli, key)
-        mcp_val = avg(mcp, key)
-        diff = mcp_val - cli_val
-        # Lower is better for tokens/time; higher is better for answer length
-        if key == "answer_length":
-            winner = "MCP" if mcp_val > cli_val else "CLI"
-        else:
-            winner = "CLI" if cli_val <= mcp_val else "MCP"
-        print(f"  {label:<28} {cli_val:>15,.1f} {mcp_val:>15,.1f} {diff:>+14,.1f} {winner:>12}")
-
+    for label,key in [("Avg input tokens","input_tokens"),("Avg output tokens","output_tokens"),
+                      ("Avg total tokens","total_tokens"),("Avg tool calls","tool_calls_made"),
+                      ("Avg elapsed (s)","elapsed_seconds"),("Avg answer length","answer_length"),
+                      ("Avg messages","message_count")]:
+        cv=avg(cli,key); mv=avg(mcp,key); diff=mv-cv
+        winner = "MCP" if key=="answer_length" and mv>cv else ("CLI" if cv<=mv else "MCP")
+        print(f"  {label:<28} {cv:>15,.1f} {mv:>15,.1f} {diff:>+14,.1f} {winner:>12}")
     print(sep)
-
-    # Per-task breakdown
-    print(f"\n{'PER-TASK BREAKDOWN':^100}")
-    print(sep)
-    for i, task in enumerate(TASKS):
-        cm = cli[i]
-        mm = mcp[i]
+    print(f"\n{'PER-TASK BREAKDOWN':^100}\n{sep}")
+    for i,task in enumerate(TASKS):
+        cm=cli[i]; mm=mcp[i]
         print(f"\n  Task {i+1}: {task[:70]}")
         print(f"    {'':20} {'CLI-Opt':>12} {'MCP':>12} {'Diff':>12}")
         print(f"    {'Tool calls':<20} {cm['tool_calls_made']:>12} {mm['tool_calls_made']:>12} {mm['tool_calls_made']-cm['tool_calls_made']:>+12}")
         print(f"    {'Total tokens':<20} {cm['total_tokens']:>12,} {mm['total_tokens']:>12,} {mm['total_tokens']-cm['total_tokens']:>+12,}")
-        print(f"    {'Input tokens':<20} {cm['input_tokens']:>12,} {mm['input_tokens']:>12,} {mm['input_tokens']-cm['input_tokens']:>+12,}")
         print(f"    {'Time (s)':<20} {cm['elapsed_seconds']:>12.1f} {mm['elapsed_seconds']:>12.1f} {mm['elapsed_seconds']-cm['elapsed_seconds']:>+12.1f}")
 
-    # Context window analysis
-    print(f"\n{'CONTEXT WINDOW ANALYSIS':^100}")
-    print(sep)
-    print(f"  CLI-Optimized: 1 tool (run_cli) + compact system prompt (no README)")
-    mcp_tc = mcp[0].get("tool_count", 0) if mcp else 0
-    print(f"  MCP:           {mcp_tc} tools with JSON schemas auto-injected")
-    print(f"  CLI-Optimized avg input tokens: {avg(cli, 'input_tokens'):>10,.0f}")
-    print(f"  MCP avg input tokens:           {avg(mcp, 'input_tokens'):>10,.0f}")
-    token_diff = avg(mcp, 'input_tokens') - avg(cli, 'input_tokens')
-    print(f"  MCP schema overhead (avg):      {token_diff:>+10,.0f} tokens")
 
-
+@traceable(name="benchmark_harness", run_type="chain")
 async def main():
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        sys.exit("Set ANTHROPIC_API_KEY in your environment first.")
-
-    print(f"Benchmark: CLI-Optimized vs MCP")
-    print(f"Tasks: {len(TASKS)}")
-    print(f"MCP Server: {SERVER_SCRIPT}")
-    print(f"Model: claude-sonnet-4-6\n")
-
-    all_results: dict[str, list[dict]] = {a: [] for a, _ in APPROACHES}
-
-    for i, task in enumerate(TASKS):
-        print(f"\n{'='*70}")
-        print(f"Task {i+1}/{len(TASKS)}: {task}")
-        print(f"{'='*70}")
-
-        for approach_name, runner in APPROACHES:
-            print(f"\n  --- {approach_name} ---")
+    if not os.getenv("ANTHROPIC_API_KEY"): sys.exit("Set ANTHROPIC_API_KEY first.")
+    print(f"Benchmark: CLI-Optimized vs MCP\nTasks: {len(TASKS)}\nModel: claude-sonnet-4-6\n")
+    all_results = {a:[] for a,_ in APPROACHES}
+    for i,task in enumerate(TASKS):
+        print(f"\n{'='*70}\nTask {i+1}/{len(TASKS)}: {task}\n{'='*70}")
+        for name,runner in APPROACHES:
+            print(f"\n  --- {name} ---")
             try:
                 metrics = await runner(task)
-                all_results[approach_name].append(metrics)
-                print(f"  Done: {metrics['tool_calls_made']} calls, "
-                      f"{metrics['total_tokens']:,} tokens, "
-                      f"{metrics['elapsed_seconds']}s")
+                all_results[name].append(metrics)
+                print(f"  Done: {metrics['tool_calls_made']} calls, {metrics['total_tokens']:,} tokens, {metrics['elapsed_seconds']}s")
             except Exception as e:
                 print(f"  ERROR: {e}")
-                all_results[approach_name].append(
-                    _empty_metrics(approach_name, task)
-                )
-
-    # Print comparison
+                all_results[name].append(_empty_metrics(name, task))
     print_comparison(all_results)
-
-    # Export results
-    output = {
-        "model": "claude-sonnet-4-6",
-        "tasks": TASKS,
-        "results": {k: v for k, v in all_results.items()},
-    }
+    output = {"model":"claude-sonnet-4-6","tasks":TASKS,"results":all_results}
     out_file = WORKDIR / "benchmark_results.json"
     out_file.write_text(json.dumps(output, indent=2, default=str))
     print(f"\nResults exported to: {out_file}")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
